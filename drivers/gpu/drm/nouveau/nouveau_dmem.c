@@ -100,7 +100,7 @@ unsigned long nouveau_dmem_page_addr(struct page *page)
 	unsigned long off = (page_to_pfn(page) << PAGE_SHIFT) -
 				chunk->pagemap.res.start;
 
-	return chunk->bo->bo.offset + off;
+	return chunk->bo->offset + off;
 }
 
 static void nouveau_dmem_page_free(struct page *page)
@@ -558,7 +558,7 @@ static unsigned long nouveau_dmem_migrate_copy_one(struct nouveau_drm *drm,
 					 DMA_BIDIRECTIONAL);
 		if (dma_mapping_error(dev, *dma_addr))
 			goto out_free_page;
-		if (drm->dmem->migrate.copy_func(drm, page_size(spage),
+		if (drm->dmem->migrate.copy_func(drm, 1,
 			NOUVEAU_APER_VRAM, paddr, NOUVEAU_APER_HOST, *dma_addr))
 			goto out_dma_unmap;
 	} else {

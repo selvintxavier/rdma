@@ -533,11 +533,41 @@ fail:
 	return rc;
 }
 
+static struct rdma_user_mmap_entry*
+bnxt_re_mmap_entry_insert(struct bnxt_re_ucontext *uctx, u64 mem_offset,
+			  enum bnxt_re_mmap_flag mmap_flag, u64 *offset)
+{
+	struct bnxt_re_user_mmap_entry *entry = kzalloc(sizeof(*entry), GFP_KERNEL);
+	int ret;
+
+	if (!entry)
+		return NULL;
+
+	entry->mem_offset = mem_offset;
+	entry->mmap_flag = mmap_flag;
+
+	ret = rdma_user_mmap_entry_insert(&uctx->ib_uctx,
+					  &entry->rdma_entry, PAGE_SIZE);
+	if (ret) {
+		kfree(entry);
+		return NULL;
+	}
+	if (offset)
+		*offset = rdma_user_mmap_get_offset(&entry->rdma_entry);
+
+	return &entry->rdma_entry;
+}
+
 /* Protection Domains */
 int bnxt_re_dealloc_pd(struct ib_pd *ib_pd, struct ib_udata *udata)
 {
 	struct bnxt_re_pd *pd = container_of(ib_pd, struct bnxt_re_pd, ib_pd);
 	struct bnxt_re_dev *rdev = pd->rdev;
+
+	if (udata) {
+		rdma_user_mmap_entry_remove(pd->pd_db_mmap);
+		pd->pd_db_mmap = NULL;
+	}
 
 	bnxt_re_destroy_fence_mr(pd);
 
@@ -584,7 +614,16 @@ int bnxt_re_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 		resp.pdid = pd->qplib_pd.id;
 		/* Still allow mapping this DBR to the new user PD. */
 		resp.dpi = ucntx->dpi.dpi;
-		resp.dbr = (u64)ucntx->dpi.umdbr;
+
+		pd->pd_db_mmap = bnxt_re_mmap_entry_insert(ucntx, (u64)ucntx->dpi.umdbr,
+							   BNXT_RE_MMAP_UC_DB, &resp.dbr);
+
+		if (!pd->pd_db_mmap) {
+			ibdev_err(&rdev->ibdev,
+				  "Failed to insert mmap entry\n");
+			goto dbfail;
+		}
+
 
 		rc = ib_copy_to_udata(udata, &resp, sizeof(resp));
 		if (rc) {
@@ -3994,6 +4033,13 @@ int bnxt_re_alloc_ucontext(struct ib_ucontext *ctx, struct ib_udata *udata)
 	resp.comp_mask |= BNXT_RE_UCNTX_CMASK_HAVE_MODE;
 	resp.mode = rdev->chip_ctx->modes.wqe_mode;
 
+	uctx->shpage_mmap = bnxt_re_mmap_entry_insert(uctx, 0, BNXT_RE_MMAP_SH_PAGE, NULL);
+	if (!uctx->shpage_mmap) {
+		ibdev_err(ibdev, "Failed to create mmap entry for shared page\n");
+		rc = -ENOMEM;
+		goto cfail;
+	}
+
 	rc = ib_copy_to_udata(udata, &resp, min(udata->outlen, sizeof(resp)));
 	if (rc) {
 		ibdev_err(ibdev, "Failed to copy user context");
@@ -4017,6 +4063,8 @@ void bnxt_re_dealloc_ucontext(struct ib_ucontext *ib_uctx)
 
 	struct bnxt_re_dev *rdev = uctx->rdev;
 
+	rdma_user_mmap_entry_remove(uctx->shpage_mmap);
+	uctx->shpage_mmap = NULL;
 	if (uctx->shpg)
 		free_page((unsigned long)uctx->shpg);
 
@@ -4036,27 +4084,57 @@ int bnxt_re_mmap(struct ib_ucontext *ib_uctx, struct vm_area_struct *vma)
 	struct bnxt_re_ucontext *uctx = container_of(ib_uctx,
 						   struct bnxt_re_ucontext,
 						   ib_uctx);
+	struct bnxt_re_user_mmap_entry *bnxt_entry;
+	struct rdma_user_mmap_entry *rdma_entry;
 	struct bnxt_re_dev *rdev = uctx->rdev;
+	int ret = 0;
 	u64 pfn;
 
-	if (vma->vm_end - vma->vm_start != PAGE_SIZE)
+	rdma_entry = rdma_user_mmap_entry_get(&uctx->ib_uctx, vma);
+	if (!rdma_entry) {
+		ibdev_err(&rdev->ibdev,
+			  "%s: No valid rdma_entry pgoffset = 0x%lx\n",
+			  __func__, vma->vm_pgoff);
 		return -EINVAL;
+	}
 
-	if (vma->vm_pgoff) {
-		vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-		if (io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
-				       PAGE_SIZE, vma->vm_page_prot)) {
-			ibdev_err(&rdev->ibdev, "Failed to map DPI");
-			return -EAGAIN;
-		}
-	} else {
+	bnxt_entry = container_of(rdma_entry, struct bnxt_re_user_mmap_entry,
+				  rdma_entry);
+
+	switch (bnxt_entry->mmap_flag) {
+	case BNXT_RE_MMAP_UC_DB:
+		pfn = bnxt_entry->mem_offset >> PAGE_SHIFT;
+		ret = rdma_user_mmap_io(ib_uctx, vma, pfn, PAGE_SIZE,
+					pgprot_noncached(vma->vm_page_prot),
+				rdma_entry);
+		if (ret)
+			ibdev_err(&rdev->ibdev, "Failed to map shared page");
+		break;
+	case BNXT_RE_MMAP_SH_PAGE:
 		pfn = virt_to_phys(uctx->shpg) >> PAGE_SHIFT;
 		if (remap_pfn_range(vma, vma->vm_start,
 				    pfn, PAGE_SIZE, vma->vm_page_prot)) {
 			ibdev_err(&rdev->ibdev, "Failed to map shared page");
-			return -EAGAIN;
+			ret =  -EAGAIN;
 		}
+		break;
+	default:
+		ibdev_err(&rdev->ibdev,
+			  "%s: invalid mmap flag = 0x%x\n", __func__, bnxt_entry->mmap_flag);
+		ret = -EINVAL;
+		break;
 	}
 
-	return 0;
+	rdma_user_mmap_entry_put(rdma_entry);
+	return ret;
+}
+
+void bnxt_re_mmap_free(struct rdma_user_mmap_entry *rdma_entry)
+{
+	struct bnxt_re_user_mmap_entry *bnxt_entry;
+
+	bnxt_entry = container_of(rdma_entry, struct bnxt_re_user_mmap_entry,
+				  rdma_entry);
+
+	kfree(bnxt_entry);
 }

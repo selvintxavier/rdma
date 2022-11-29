@@ -83,6 +83,7 @@ static int bnxt_re_netdev_event(struct notifier_block *notifier,
 				unsigned long event, void *ptr);
 static struct bnxt_re_dev *bnxt_re_from_netdev(struct net_device *netdev);
 static void bnxt_re_dev_uninit(struct bnxt_re_dev *rdev);
+static int bnxt_re_hwrm_qcaps(struct bnxt_re_dev *rdev);
 
 static void bnxt_re_set_drv_mode(struct bnxt_re_dev *rdev, u8 mode)
 {
@@ -91,6 +92,9 @@ static void bnxt_re_set_drv_mode(struct bnxt_re_dev *rdev, u8 mode)
 	cctx = rdev->chip_ctx;
 	cctx->modes.wqe_mode = bnxt_qplib_is_chip_gen_p5(rdev->chip_ctx) ?
 			       mode : BNXT_QPLIB_WQE_MODE_STATIC;
+	if (bnxt_re_hwrm_qcaps(rdev))
+		dev_err(rdev_to_dev(rdev),
+			"Failed to query hwrm qcaps\n");
 }
 
 static void bnxt_re_destroy_chip_ctx(struct bnxt_re_dev *rdev)
@@ -332,6 +336,32 @@ static void bnxt_re_fill_fw_msg(struct bnxt_fw_msg *fw_msg, void *msg,
 	fw_msg->resp = resp;
 	fw_msg->resp_max_len = resp_max_len;
 	fw_msg->timeout = timeout;
+}
+
+/* Query function capabilities using common hwrm */
+int bnxt_re_hwrm_qcaps(struct bnxt_re_dev *rdev)
+{
+	struct bnxt_en_dev *en_dev = rdev->en_dev;
+	struct hwrm_func_qcaps_output resp = {0};
+	struct hwrm_func_qcaps_input req = {0};
+	struct bnxt_qplib_chip_ctx *cctx;
+	struct bnxt_fw_msg fw_msg;
+	int rc;
+
+	cctx = rdev->chip_ctx;
+	memset(&fw_msg, 0, sizeof(fw_msg));
+	bnxt_re_init_hwrm_hdr(rdev, (void *)&req,
+			      HWRM_FUNC_QCAPS, -1, -1);
+	req.fid = cpu_to_le16(0xffff);
+	bnxt_re_fill_fw_msg(&fw_msg, (void *)&req, sizeof(req), (void *)&resp,
+			    sizeof(resp), DFLT_HWRM_CMD_TIMEOUT);
+	rc = bnxt_send_msg(en_dev, &fw_msg);
+	if (rc) {
+		dev_err(rdev_to_dev(rdev),
+			"Failed to query capabilities, rc = %#x", rc);
+		return rc;
+	}
+	return 0;
 }
 
 static int bnxt_re_net_ring_free(struct bnxt_re_dev *rdev,

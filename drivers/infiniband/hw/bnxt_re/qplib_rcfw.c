@@ -593,7 +593,7 @@ int bnxt_qplib_alloc_rcfw_channel(struct bnxt_qplib_res *res,
 			"HW channel CREQ allocation failed\n");
 		goto fail;
 	}
-	if (ctx->hwrm_intf_ver < HWRM_VERSION_RCFW_CMDQ_DEPTH_CHECK)
+	if (res->cctx->hwrm_intf_ver < HWRM_VERSION_RCFW_CMDQ_DEPTH_CHECK)
 		rcfw->cmdq_depth = BNXT_QPLIB_CMDQE_MAX_CNT_256;
 	else
 		rcfw->cmdq_depth = BNXT_QPLIB_CMDQE_MAX_CNT_8192;

@@ -111,6 +111,7 @@ static inline u32 bnxt_qplib_set_cmd_slots(struct cmdq_base *req)
 #define RCFW_BLOCKED_CMD_WAIT_COUNT	20000000UL /* 20 sec */
 
 #define HWRM_VERSION_RCFW_CMDQ_DEPTH_CHECK 0x1000900020011ULL
+#define HWRM_VERSION_DEV_ATTR_MAX_DPI  0x1000A0000000DULL
 
 /* Crsq buf is 1024-Byte */
 struct bnxt_qplib_crsbe {

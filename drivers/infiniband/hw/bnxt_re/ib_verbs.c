@@ -566,6 +566,9 @@ int bnxt_re_dealloc_pd(struct ib_pd *ib_pd, struct ib_udata *udata)
 
 	if (udata) {
 		rdma_user_mmap_entry_remove(pd->pd_db_mmap);
+		if (pd->pd_wcdb_mmap)
+			rdma_user_mmap_entry_remove(pd->pd_wcdb_mmap);
+		pd->pd_wcdb_mmap = NULL;
 		pd->pd_db_mmap = NULL;
 	}
 
@@ -597,6 +600,7 @@ int bnxt_re_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 	}
 
 	if (udata) {
+		struct bnxt_qplib_chip_ctx *cctx = rdev->chip_ctx;
 		struct bnxt_re_pd_resp resp;
 
 		if (!ucntx->dpi.dbr) {
@@ -606,8 +610,22 @@ int bnxt_re_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 			 */
 			if (bnxt_qplib_alloc_dpi(&rdev->qplib_res,
 						 &ucntx->dpi, ucntx, BNXT_QPLIB_DPI_TYPE_UC)) {
+				dev_err(rdev_to_dev(rdev), "DP alloc failed");
 				rc = -ENOMEM;
 				goto dbfail;
+			}
+			if (cctx->modes.db_push) {
+				rc = bnxt_qplib_alloc_dpi(&rdev->qplib_res, &ucntx->wcdpi,
+							  ucntx, BNXT_QPLIB_DPI_TYPE_WC);
+				if (rc) {
+					dev_err(rdev_to_dev(rdev), "push dp alloc failed");
+					bnxt_qplib_dealloc_dpi(&rdev->qplib_res, &ucntx->dpi);
+					ucntx->dpi.dbr = NULL;
+					rc = -ENOMEM;
+					goto dbfail;
+				}
+				resp.wcdpi = ucntx->wcdpi.dpi;
+				resp.comp_mask = BNXT_RE_COMP_MASK_PD_HAS_WC_DPI;
 			}
 		}
 
@@ -624,6 +642,14 @@ int bnxt_re_alloc_pd(struct ib_pd *ibpd, struct ib_udata *udata)
 			goto dbfail;
 		}
 
+		pd->pd_wcdb_mmap = bnxt_re_mmap_entry_insert(ucntx, (u64)ucntx->wcdpi.umdbr,
+							     BNXT_RE_MMAP_WC_DB, &resp.wcdbr);
+
+		if (!pd->pd_wcdb_mmap) {
+			ibdev_err(&rdev->ibdev,
+				  "Failed to insert mmap entry\n");
+			goto dbfail;
+		}
 
 		rc = ib_copy_to_udata(udata, &resp, sizeof(resp));
 		if (rc) {
@@ -4033,6 +4059,9 @@ int bnxt_re_alloc_ucontext(struct ib_ucontext *ctx, struct ib_udata *udata)
 	resp.comp_mask |= BNXT_RE_UCNTX_CMASK_HAVE_MODE;
 	resp.mode = rdev->chip_ctx->modes.wqe_mode;
 
+	if (rdev->chip_ctx->modes.db_push)
+		resp.comp_mask |= BNXT_RE_UCNTX_CMASK_WC_DPI_ENABLED;
+
 	uctx->shpage_mmap = bnxt_re_mmap_entry_insert(uctx, 0, BNXT_RE_MMAP_SH_PAGE, NULL);
 	if (!uctx->shpage_mmap) {
 		ibdev_err(ibdev, "Failed to create mmap entry for shared page\n");
@@ -4072,6 +4101,10 @@ void bnxt_re_dealloc_ucontext(struct ib_ucontext *ib_uctx)
 		/* Free DPI only if this is the first PD allocated by the
 		 * application and mark the context dpi as NULL
 		 */
+		if (uctx->wcdpi.dbr) {
+			bnxt_qplib_dealloc_dpi(&rdev->qplib_res, &uctx->wcdpi);
+			uctx->wcdpi.dbr = NULL;
+		}
 		bnxt_qplib_dealloc_dpi(&rdev->qplib_res, &uctx->dpi);
 		uctx->dpi.dbr = NULL;
 	}
@@ -4101,6 +4134,14 @@ int bnxt_re_mmap(struct ib_ucontext *ib_uctx, struct vm_area_struct *vma)
 				  rdma_entry);
 
 	switch (bnxt_entry->mmap_flag) {
+	case BNXT_RE_MMAP_WC_DB:
+		pfn = bnxt_entry->mem_offset >> PAGE_SHIFT;
+		ret = rdma_user_mmap_io(ib_uctx, vma, pfn, PAGE_SIZE,
+					pgprot_writecombine(vma->vm_page_prot),
+					rdma_entry);
+		if (ret)
+			ibdev_err(&rdev->ibdev, "Failed to map WC DB");
+		break;
 	case BNXT_RE_MMAP_UC_DB:
 		pfn = bnxt_entry->mem_offset >> PAGE_SHIFT;
 		ret = rdma_user_mmap_io(ib_uctx, vma, pfn, PAGE_SIZE,

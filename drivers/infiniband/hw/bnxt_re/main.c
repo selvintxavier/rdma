@@ -117,6 +117,11 @@ static void bnxt_re_set_db_offset(struct bnxt_re_dev *rdev)
 	 * in such cases and DB-push will be disabled.
 	 */
 	barlen = pci_resource_len(res->pdev, RCFW_DBR_PCI_BAR_REGION);
+	if (cctx->modes.db_push && l2db_len && en_dev->l2_db_size != barlen) {
+		res->dpi_tbl.wcreg.offset = en_dev->l2_db_size;
+		dev_info(rdev_to_dev(rdev),
+			 "Low latency framework is enabled\n");
+	}
 }
 
 static void bnxt_re_set_drv_mode(struct bnxt_re_dev *rdev, u8 mode)
@@ -430,6 +435,11 @@ int bnxt_re_hwrm_qcaps(struct bnxt_re_dev *rdev)
 			"Failed to query capabilities, rc = %#x", rc);
 		return rc;
 	}
+	cctx->modes.db_push = resp.flags & FUNC_QCAPS_RESP_FLAGS_WCB_PUSH_MODE;
+
+	if (cctx->modes.db_push)
+		ibdev_dbg(&rdev->ibdev, "DB push enabled");
+
 	return 0;
 }
 
